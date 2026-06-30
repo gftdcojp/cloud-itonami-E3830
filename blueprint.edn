@@ -1,0 +1,8 @@
+{:itonami.blueprint/id "cloud-itonami-3830"
+ :itonami.blueprint/name "Local Materials Recovery"
+ :itonami.blueprint/isic-rev5 "3830"
+ :itonami.blueprint/domain :circular/materials-recovery
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:waste-reduction :local-jobs :resource-efficiency]
+ :itonami.blueprint/governor :traceability-governor
+ :itonami.blueprint/status :public-oss}
