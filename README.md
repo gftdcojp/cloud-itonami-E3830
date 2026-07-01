@@ -5,6 +5,14 @@ Open Business Blueprint for **ISIC Rev.5 3830**: materials recovery.
 This repository designs a forkable OSS business for community recycling,
 reuse, repair, material traceability and local circular-economy operations.
 
+## Robotics premise
+
+All cloud-itonami verticals are designed on the premise that a **robot performs
+the physical domain work**. Here a sorting and handling robot performs grading, baling and loadout of recovered materials under an actor that proposes
+actions and an independent **Traceability Governor** that gates them. The governor never
+dispatches hardware itself; `:high`/`:safety-critical` actions (such as
+operating near heavy bales, baling equipment or conveyors) require human sign-off.
+
 ## Core Contract
 
 ```text
