@@ -13,6 +13,8 @@ actions and an independent **Traceability Governor** that gates them. The govern
 dispatches hardware itself; `:high`/`:safety-critical` actions (such as
 operating near heavy bales, baling equipment or conveyors) require human sign-off.
 
+A live sample of the operator console (robotics safety console, shared template) is rendered in [docs/samples/operator-console.html](docs/samples/operator-console.html) — pure-data HTML output of `kotoba.robotics.ui`.
+
 ## Core Contract
 
 ```text
