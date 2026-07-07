@@ -2,7 +2,7 @@
 
 ## Classification
 
-- Repository: `cloud-itonami-3830`
+- Repository: `cloud-itonami-isic-3830`
 - ISIC Rev.5: `3830`
 - Activity: materials recovery
 - Social impact: waste reduction, local jobs, lower resource extraction
@@ -38,3 +38,10 @@
 - custody transfers are append-only
 - contamination decisions are auditable
 - impact claims reference weighed or verified records
+- a fabricated grading-standard citation, incomplete evidence, an
+  over-contaminated batch, or an unresolved contamination flag -- each
+  forces a hold, not an override
+- impact-report publication is logged and escalated, and cannot be
+  finalized twice for the same batch: a double-publication attempt is
+  held off this actor's own batch facts alone, with no upstream
+  comparison needed

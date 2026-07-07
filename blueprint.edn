@@ -1,4 +1,4 @@
-{:itonami.blueprint/id "cloud-itonami-3830"
+{:itonami.blueprint/id "cloud-itonami-isic-3830"
  :itonami.blueprint/name "Local Materials Recovery"
  :itonami.blueprint/isic-rev5 "3830"
  :itonami.blueprint/domain :circular/materials-recovery
@@ -6,4 +6,7 @@
  :itonami.blueprint/social-impact [:waste-reduction :local-jobs :resource-efficiency]
  :itonami.blueprint/governor :traceability-governor
  :itonami.blueprint/robotics true
- :itonami.blueprint/status :public-oss}
+ :itonami.blueprint/required-technologies [:robotics :forms :telemetry :optimization :audit-ledger :bpmn :dmn]
+ :itonami.blueprint/optional-technologies [:identity]
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/maturity :implemented}

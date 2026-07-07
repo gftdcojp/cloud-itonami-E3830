@@ -1,0 +1,319 @@
+(ns recovery.store
+  "SSoT for the materials-recovery actor, behind a `Store` protocol so
+  the backend is a swap, not a rewrite -- the same seam every prior
+  `cloud-itonami-isic-*` actor in this fleet uses:
+
+    - `MemStore`     -- atom of EDN. The deterministic default for
+                        dev/tests/demo (no deps).
+    - `DatomicStore` -- backed by `langchain.db`, a Datomic-API-compatible
+                        EAV store (datalog q / pull / upsert). Pure `.cljc`,
+                        so it runs offline AND can be pointed at a real
+                        Datomic Local or a kotoba-server pod by swapping
+                        `langchain.db`'s `:db-api` (see langchain.kotoba-db).
+
+  Both implement the same protocol and pass the same contract
+  (test/recovery/store_contract_test.clj), which is the whole point:
+  the actor, the Traceability Governor and the audit ledger never know
+  which SSoT they run on.
+
+  Like `aerospace.store`'s dual assembly-dispatch/airworthiness-
+  evidence history and every other dual-actuation sibling before it,
+  this actor has TWO actuation events (certifying a material grade,
+  publishing an impact report) acting on the SAME entity (a batch),
+  each with its OWN history collection, sequence counter and dedicated
+  double-actuation-guard boolean (`:material-grade-certified?`/
+  `:impact-report-published?`, never a `:status` value) -- the same
+  discipline every prior sibling governor's guards establish, informed
+  by `cloud-itonami-isic-6492`'s status-lifecycle bug
+  (ADR-2607071320).
+
+  The ledger stays append-only on every backend: 'which batch was
+  screened for an unresolved contamination flag, which grade was
+  certified, which impact report was published, on what jurisdictional
+  basis, approved by whom' is always a query over an immutable log --
+  the audit trail a community trusting a materials-recovery operator
+  needs, and the evidence an operator needs if a grade-certification
+  or impact-report decision is later disputed."
+  (:require #?(:clj  [clojure.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [recovery.registry :as registry]
+            [langchain.db :as d]))
+
+(defprotocol Store
+  (batch [s id])
+  (all-batches [s])
+  (contamination-screen-of [s batch-id] "committed contamination-flag screening verdict for a batch, or nil")
+  (grading-verification-of [s batch-id] "committed grading verification, or nil")
+  (ledger [s])
+  (certification-history [s] "the append-only material-grade-certification history (recovery.registry drafts)")
+  (report-history [s] "the append-only impact-report history (recovery.registry drafts)")
+  (next-certification-sequence [s jurisdiction] "next certification-number sequence for a jurisdiction")
+  (next-report-sequence [s jurisdiction] "next report-number sequence for a jurisdiction")
+  (batch-already-certified? [s batch-id] "has this batch's material grade already been certified?")
+  (batch-already-published? [s batch-id] "has this batch's impact report already been published?")
+  (commit-record! [s record] "apply a committed op's record to the SSoT")
+  (append-ledger! [s fact]   "append one immutable decision fact")
+  (with-batches [s batches] "replace/seed the batch directory (map id->batch)"))
+
+;; ----------------------------- demo data -----------------------------
+
+(defn demo-data
+  "A small, self-contained batch set covering both actuation
+  lifecycles (certifying a material grade, publishing an impact
+  report) so the actor + tests run offline."
+  []
+  {:batches
+   {"batch-1" {:id "batch-1" :batch-name "Sakura Community MRF Batch 4"
+               :contamination-percentage 2.0 :contamination-max-allowed 5.0
+               :contamination-flag-unresolved? false
+               :material-grade-certified? false :impact-report-published? false
+               :jurisdiction "JPN" :status :intake}
+    "batch-2" {:id "batch-2" :batch-name "Atlantis Co-op Batch"
+               :contamination-percentage 2.0 :contamination-max-allowed 5.0
+               :contamination-flag-unresolved? false
+               :material-grade-certified? false :impact-report-published? false
+               :jurisdiction "ATL" :status :intake}
+    "batch-3" {:id "batch-3" :batch-name "鈴木リサイクルセンター Batch"
+               :contamination-percentage 8.0 :contamination-max-allowed 5.0
+               :contamination-flag-unresolved? false
+               :material-grade-certified? false :impact-report-published? false
+               :jurisdiction "JPN" :status :intake}
+    "batch-4" {:id "batch-4" :batch-name "田中資源回収 Batch"
+               :contamination-percentage 2.0 :contamination-max-allowed 5.0
+               :contamination-flag-unresolved? true
+               :material-grade-certified? false :impact-report-published? false
+               :jurisdiction "JPN" :status :intake}}})
+
+;; ----------------------------- shared commit logic -----------------------------
+
+(defn- certify-material-grade!
+  "Backend-agnostic `:batch/mark-certified` -- looks up the batch via
+  the protocol and drafts the material-grade-certification record, and
+  returns {:result .. :batch-patch ..} for the caller to persist."
+  [s batch-id]
+  (let [b (batch s batch-id)
+        seq-n (next-certification-sequence s (:jurisdiction b))
+        result (registry/register-material-grade-certification batch-id (:jurisdiction b) seq-n)]
+    {:result result
+     :batch-patch {:material-grade-certified? true
+                  :certification-number (get result "certification_number")}}))
+
+(defn- publish-impact-report!
+  "Backend-agnostic `:batch/mark-published` -- looks up the batch via
+  the protocol and drafts the impact-report record, and returns
+  {:result .. :batch-patch ..} for the caller to persist."
+  [s batch-id]
+  (let [b (batch s batch-id)
+        seq-n (next-report-sequence s (:jurisdiction b))
+        result (registry/register-impact-report batch-id (:jurisdiction b) seq-n)]
+    {:result result
+     :batch-patch {:impact-report-published? true
+                  :report-number (get result "report_number")}}))
+
+;; ----------------------------- MemStore (default) -----------------------------
+
+(defrecord MemStore [a]
+  Store
+  (batch [_ id] (get-in @a [:batches id]))
+  (all-batches [_] (sort-by :id (vals (:batches @a))))
+  (contamination-screen-of [_ id] (get-in @a [:contamination-screens id]))
+  (grading-verification-of [_ batch-id] (get-in @a [:verifications batch-id]))
+  (ledger [_] (:ledger @a))
+  (certification-history [_] (:certifications @a))
+  (report-history [_] (:reports @a))
+  (next-certification-sequence [_ jurisdiction] (get-in @a [:certification-sequences jurisdiction] 0))
+  (next-report-sequence [_ jurisdiction] (get-in @a [:report-sequences jurisdiction] 0))
+  (batch-already-certified? [_ batch-id] (boolean (get-in @a [:batches batch-id :material-grade-certified?])))
+  (batch-already-published? [_ batch-id] (boolean (get-in @a [:batches batch-id :impact-report-published?])))
+  (commit-record! [s {:keys [effect path value payload]}]
+    (case effect
+      :batch/upsert
+      (swap! a update-in [:batches (:id value)] merge value)
+
+      :verification/set
+      (swap! a assoc-in [:verifications (first path)] payload)
+
+      :contamination-screen/set
+      (swap! a assoc-in [:contamination-screens (first path)] payload)
+
+      :batch/mark-certified
+      (let [batch-id (first path)
+            {:keys [result batch-patch]} (certify-material-grade! s batch-id)
+            jurisdiction (:jurisdiction (batch s batch-id))]
+        (swap! a (fn [state]
+                   (-> state
+                       (update-in [:certification-sequences jurisdiction] (fnil inc 0))
+                       (update-in [:batches batch-id] merge batch-patch)
+                       (update :certifications registry/append result))))
+        result)
+
+      :batch/mark-published
+      (let [batch-id (first path)
+            {:keys [result batch-patch]} (publish-impact-report! s batch-id)
+            jurisdiction (:jurisdiction (batch s batch-id))]
+        (swap! a (fn [state]
+                   (-> state
+                       (update-in [:report-sequences jurisdiction] (fnil inc 0))
+                       (update-in [:batches batch-id] merge batch-patch)
+                       (update :reports registry/append result))))
+        result)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (with-batches [s batches] (when (seq batches) (swap! a assoc :batches batches)) s))
+
+(defn seed-db
+  "A MemStore seeded with the demo batch set. The deterministic
+  default."
+  []
+  (->MemStore (atom (assoc (demo-data)
+                           :verifications {} :contamination-screens {} :ledger [] :certification-sequences {}
+                           :certifications [] :report-sequences {} :reports []))))
+
+;; ----------------------------- DatomicStore (langchain.db) -----------------------------
+
+(def ^:private schema
+  "DataScript/Datomic-style schema: only constraint attrs are declared.
+  Map/compound values (verification/contamination-screen payloads,
+  ledger facts, certification/report records) are stored as EDN
+  strings so `langchain.db` doesn't expand them into sub-entities --
+  the same convention every sibling actor's store uses."
+  {:batch/id                          {:db/unique :db.unique/identity}
+   :verification/batch-id             {:db/unique :db.unique/identity}
+   :contamination-screen/batch-id     {:db/unique :db.unique/identity}
+   :ledger/seq                        {:db/unique :db.unique/identity}
+   :certification/seq                 {:db/unique :db.unique/identity}
+   :report/seq                        {:db/unique :db.unique/identity}
+   :certification-sequence/jurisdiction {:db/unique :db.unique/identity}
+   :report-sequence/jurisdiction      {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+(defn- batch->tx [{:keys [id batch-name contamination-percentage contamination-max-allowed
+                         contamination-flag-unresolved?
+                         material-grade-certified? impact-report-published?
+                         jurisdiction status certification-number report-number]}]
+  (cond-> {:batch/id id}
+    batch-name                                  (assoc :batch/batch-name batch-name)
+    contamination-percentage                    (assoc :batch/contamination-percentage contamination-percentage)
+    contamination-max-allowed                   (assoc :batch/contamination-max-allowed contamination-max-allowed)
+    (some? contamination-flag-unresolved?)      (assoc :batch/contamination-flag-unresolved? contamination-flag-unresolved?)
+    (some? material-grade-certified?)           (assoc :batch/material-grade-certified? material-grade-certified?)
+    (some? impact-report-published?)            (assoc :batch/impact-report-published? impact-report-published?)
+    jurisdiction                                (assoc :batch/jurisdiction jurisdiction)
+    status                                      (assoc :batch/status status)
+    certification-number                        (assoc :batch/certification-number certification-number)
+    report-number                               (assoc :batch/report-number report-number)))
+
+(def ^:private batch-pull
+  [:batch/id :batch/batch-name :batch/contamination-percentage :batch/contamination-max-allowed
+   :batch/contamination-flag-unresolved? :batch/material-grade-certified? :batch/impact-report-published?
+   :batch/jurisdiction :batch/status :batch/certification-number :batch/report-number])
+
+(defn- pull->batch [m]
+  (when (:batch/id m)
+    {:id (:batch/id m) :batch-name (:batch/batch-name m)
+     :contamination-percentage (:batch/contamination-percentage m)
+     :contamination-max-allowed (:batch/contamination-max-allowed m)
+     :contamination-flag-unresolved? (boolean (:batch/contamination-flag-unresolved? m))
+     :material-grade-certified? (boolean (:batch/material-grade-certified? m))
+     :impact-report-published? (boolean (:batch/impact-report-published? m))
+     :jurisdiction (:batch/jurisdiction m) :status (:batch/status m)
+     :certification-number (:batch/certification-number m) :report-number (:batch/report-number m)}))
+
+(defrecord DatomicStore [conn]
+  Store
+  (batch [_ id]
+    (pull->batch (d/pull (d/db conn) batch-pull [:batch/id id])))
+  (all-batches [_]
+    (->> (d/q '[:find [?id ...] :where [?e :batch/id ?id]] (d/db conn))
+         (map #(pull->batch (d/pull (d/db conn) batch-pull [:batch/id %])))
+         (sort-by :id)))
+  (contamination-screen-of [_ id]
+    (dec* (d/q '[:find ?p . :in $ ?bid
+                :where [?k :contamination-screen/batch-id ?bid] [?k :contamination-screen/payload ?p]]
+              (d/db conn) id)))
+  (grading-verification-of [_ batch-id]
+    (dec* (d/q '[:find ?p . :in $ ?bid
+                :where [?a :verification/batch-id ?bid] [?a :verification/payload ?p]]
+              (d/db conn) batch-id)))
+  (ledger [_]
+    (->> (d/q '[:find ?s ?f :where [?e :ledger/seq ?s] [?e :ledger/fact ?f]] (d/db conn))
+         (sort-by first)
+         (mapv (comp dec* second))))
+  (certification-history [_]
+    (->> (d/q '[:find ?s ?r :where [?e :certification/seq ?s] [?e :certification/record ?r]] (d/db conn))
+         (sort-by first)
+         (mapv (comp dec* second))))
+  (report-history [_]
+    (->> (d/q '[:find ?s ?r :where [?e :report/seq ?s] [?e :report/record ?r]] (d/db conn))
+         (sort-by first)
+         (mapv (comp dec* second))))
+  (next-certification-sequence [_ jurisdiction]
+    (or (d/q '[:find ?n . :in $ ?j
+              :where [?e :certification-sequence/jurisdiction ?j] [?e :certification-sequence/next ?n]]
+            (d/db conn) jurisdiction)
+        0))
+  (next-report-sequence [_ jurisdiction]
+    (or (d/q '[:find ?n . :in $ ?j
+              :where [?e :report-sequence/jurisdiction ?j] [?e :report-sequence/next ?n]]
+            (d/db conn) jurisdiction)
+        0))
+  (batch-already-certified? [s batch-id]
+    (boolean (:material-grade-certified? (batch s batch-id))))
+  (batch-already-published? [s batch-id]
+    (boolean (:impact-report-published? (batch s batch-id))))
+  (commit-record! [s {:keys [effect path value payload]}]
+    (case effect
+      :batch/upsert
+      (d/transact! conn [(batch->tx value)])
+
+      :verification/set
+      (d/transact! conn [{:verification/batch-id (first path) :verification/payload (enc payload)}])
+
+      :contamination-screen/set
+      (d/transact! conn [{:contamination-screen/batch-id (first path) :contamination-screen/payload (enc payload)}])
+
+      :batch/mark-certified
+      (let [batch-id (first path)
+            {:keys [result batch-patch]} (certify-material-grade! s batch-id)
+            jurisdiction (:jurisdiction (batch s batch-id))
+            next-n (inc (next-certification-sequence s jurisdiction))]
+        (d/transact! conn
+                     [(batch->tx (assoc batch-patch :id batch-id))
+                      {:certification-sequence/jurisdiction jurisdiction :certification-sequence/next next-n}
+                      {:certification/seq (count (certification-history s)) :certification/record (enc (get result "record"))}])
+        result)
+
+      :batch/mark-published
+      (let [batch-id (first path)
+            {:keys [result batch-patch]} (publish-impact-report! s batch-id)
+            jurisdiction (:jurisdiction (batch s batch-id))
+            next-n (inc (next-report-sequence s jurisdiction))]
+        (d/transact! conn
+                     [(batch->tx (assoc batch-patch :id batch-id))
+                      {:report-sequence/jurisdiction jurisdiction :report-sequence/next next-n}
+                      {:report/seq (count (report-history s)) :report/record (enc (get result "record"))}])
+        result)
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (d/transact! conn [{:ledger/seq (count (ledger s)) :ledger/fact (enc fact)}])
+    fact)
+  (with-batches [s batches]
+    (when (seq batches) (d/transact! conn (mapv batch->tx (vals batches)))) s))
+
+(defn datomic-store
+  "A DatomicStore (langchain.db backend) seeded from `data`
+  ({:batches ..}); empty when omitted."
+  ([] (datomic-store {}))
+  ([{:keys [batches]}]
+   (let [s (->DatomicStore (d/create-conn schema))]
+     (with-batches s batches))))
+
+(defn datomic-seed-db
+  "A DatomicStore seeded with the demo batch set -- the Datomic-backed
+  analog of `seed-db`, used to prove protocol parity."
+  []
+  (datomic-store (demo-data)))
