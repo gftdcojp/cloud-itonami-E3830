@@ -34,10 +34,9 @@
   the audit trail a community trusting a materials-recovery operator
   needs, and the evidence an operator needs if a grade-certification
   or impact-report decision is later disputed."
-  (:require #?(:clj  [clojure.edn :as edn]
-               :cljs [cljs.reader :as edn])
-            [recovery.registry :as registry]
-            [langchain.db :as d]))
+  (:require [recovery.registry :as registry]
+            [langchain.db :as d]
+            [langchain-store.core :as ls]))
 
 (defprotocol Store
   (batch [s id])
@@ -187,9 +186,6 @@
    :certification-sequence/jurisdiction {:db/unique :db.unique/identity}
    :report-sequence/jurisdiction      {:db/unique :db.unique/identity}})
 
-(defn- enc [v] (pr-str v))
-(defn- dec* [s] (when s (edn/read-string s)))
-
 (defn- batch->tx [{:keys [id batch-name contamination-percentage contamination-max-allowed
                          contamination-flag-unresolved?
                          material-grade-certified? impact-report-published?
@@ -231,25 +227,25 @@
          (map #(pull->batch (d/pull (d/db conn) batch-pull [:batch/id %])))
          (sort-by :id)))
   (contamination-screen-of [_ id]
-    (dec* (d/q '[:find ?p . :in $ ?bid
+    (ls/dec* (d/q '[:find ?p . :in $ ?bid
                 :where [?k :contamination-screen/batch-id ?bid] [?k :contamination-screen/payload ?p]]
               (d/db conn) id)))
   (grading-verification-of [_ batch-id]
-    (dec* (d/q '[:find ?p . :in $ ?bid
+    (ls/dec* (d/q '[:find ?p . :in $ ?bid
                 :where [?a :verification/batch-id ?bid] [?a :verification/payload ?p]]
               (d/db conn) batch-id)))
   (ledger [_]
     (->> (d/q '[:find ?s ?f :where [?e :ledger/seq ?s] [?e :ledger/fact ?f]] (d/db conn))
          (sort-by first)
-         (mapv (comp dec* second))))
+         (mapv (comp ls/dec* second))))
   (certification-history [_]
     (->> (d/q '[:find ?s ?r :where [?e :certification/seq ?s] [?e :certification/record ?r]] (d/db conn))
          (sort-by first)
-         (mapv (comp dec* second))))
+         (mapv (comp ls/dec* second))))
   (report-history [_]
     (->> (d/q '[:find ?s ?r :where [?e :report/seq ?s] [?e :report/record ?r]] (d/db conn))
          (sort-by first)
-         (mapv (comp dec* second))))
+         (mapv (comp ls/dec* second))))
   (next-certification-sequence [_ jurisdiction]
     (or (d/q '[:find ?n . :in $ ?j
               :where [?e :certification-sequence/jurisdiction ?j] [?e :certification-sequence/next ?n]]
@@ -270,10 +266,10 @@
       (d/transact! conn [(batch->tx value)])
 
       :verification/set
-      (d/transact! conn [{:verification/batch-id (first path) :verification/payload (enc payload)}])
+      (d/transact! conn [{:verification/batch-id (first path) :verification/payload (ls/enc payload)}])
 
       :contamination-screen/set
-      (d/transact! conn [{:contamination-screen/batch-id (first path) :contamination-screen/payload (enc payload)}])
+      (d/transact! conn [{:contamination-screen/batch-id (first path) :contamination-screen/payload (ls/enc payload)}])
 
       :batch/mark-certified
       (let [batch-id (first path)
@@ -283,7 +279,7 @@
         (d/transact! conn
                      [(batch->tx (assoc batch-patch :id batch-id))
                       {:certification-sequence/jurisdiction jurisdiction :certification-sequence/next next-n}
-                      {:certification/seq (count (certification-history s)) :certification/record (enc (get result "record"))}])
+                      {:certification/seq (count (certification-history s)) :certification/record (ls/enc (get result "record"))}])
         result)
 
       :batch/mark-published
@@ -294,12 +290,12 @@
         (d/transact! conn
                      [(batch->tx (assoc batch-patch :id batch-id))
                       {:report-sequence/jurisdiction jurisdiction :report-sequence/next next-n}
-                      {:report/seq (count (report-history s)) :report/record (enc (get result "record"))}])
+                      {:report/seq (count (report-history s)) :report/record (ls/enc (get result "record"))}])
         result)
       nil)
     s)
   (append-ledger! [s fact]
-    (d/transact! conn [{:ledger/seq (count (ledger s)) :ledger/fact (enc fact)}])
+    (d/transact! conn [{:ledger/seq (count (ledger s)) :ledger/fact (ls/enc fact)}])
     fact)
   (with-batches [s batches]
     (when (seq batches) (d/transact! conn (mapv batch->tx (vals batches)))) s))
